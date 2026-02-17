@@ -16,6 +16,8 @@ PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET")
 
 app = Flask(__name__)
 
+application = ApplicationBuilder().token(BOT_TOKEN).build()
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("📶 Buy MTN Data", callback_data="mtn")],
@@ -63,10 +65,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Click below to pay:\n{payment_link}"
         )
 
-application = ApplicationBuilder().token(BOT_TOKEN).build()
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CallbackQueryHandler(button))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
+async def webhook():
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    await application.process_update(update)
+    return "ok"
 
 @app.route("/")
 def home():
@@ -74,4 +81,11 @@ def home():
 
 if __name__ == "__main__":
     import asyncio
-    asyncio.run(application.run_polling())
+
+    asyncio.get_event_loop().run_until_complete(
+        application.bot.set_webhook(
+            url=f"https://richbook-telegram-bot.onrender.com/{BOT_TOKEN}"
+        )
+    )
+
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
