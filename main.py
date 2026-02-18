@@ -1,6 +1,8 @@
+import os
 import telebot
 import requests
-import os
+import threading
+from flask import Flask
 
 # ===============================
 # ENVIRONMENT VARIABLES
@@ -13,13 +15,14 @@ ADMIN_ID = 8415879298
 users = set()
 
 bot = telebot.TeleBot(BOT_TOKEN)
+app = Flask(__name__)
 
 # ===============================
-# START COMMAND
+# TELEGRAM COMMANDS
 # ===============================
 
 @bot.message_handler(commands=['start'])
-def send_welcome(message):
+def start(message):
     users.add(message.chat.id)
 
     markup = telebot.types.InlineKeyboardMarkup()
@@ -34,21 +37,15 @@ def send_welcome(message):
         reply_markup=markup
     )
 
-# ===============================
-# HANDLE BUTTON CLICKS
-# ===============================
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
     bot.send_message(call.message.chat.id, "Enter amount in GHS (Example: 10)")
 
-# ===============================
-# HANDLE PAYMENT AMOUNT
-# ===============================
 
 @bot.message_handler(func=lambda message: message.text.isdigit())
 def handle_payment(message):
-    amount = int(message.text) * 100  # Convert to kobo/pesewas
+    amount = int(message.text) * 100
 
     headers = {
         "Authorization": f"Bearer {PAYSTACK_SECRET}",
@@ -75,7 +72,8 @@ def handle_payment(message):
             f"💳 Click below to pay:\n{payment_link}"
         )
     else:
-        bot.send_message(message.chat.id, "❌ Payment link failed. Try again.")
+        bot.send_message(message.chat.id, "❌ Payment failed. Try again.")
+
 
 # ===============================
 # ADMIN PANEL
@@ -88,12 +86,9 @@ def admin_panel(message):
 
     bot.send_message(
         message.chat.id,
-        f"📊 Admin Panel\n\nTotal Users: {len(users)}\n\nSend:\n/broadcast Your message"
+        f"📊 Admin Panel\n\nTotal Users: {len(users)}\n\nUse:\n/broadcast Your message"
     )
 
-# ===============================
-# BROADCAST
-# ===============================
 
 @bot.message_handler(commands=['broadcast'])
 def broadcast(message):
@@ -110,28 +105,32 @@ def broadcast(message):
 
     bot.send_message(message.chat.id, "✅ Broadcast sent.")
 
+
 # ===============================
-# RUN BOT
+# FLASK ROUTE (FOR RENDER PORT)
 # ===============================
-
-bot.infinity_polling()
-
-import threading
-from flask import Flask
-
-app = Flask(__name__)
 
 @app.route('/')
 def home():
     return "Bot is running!"
 
+
+# ===============================
+# START BOT IN BACKGROUND
+# ===============================
+
 def run_bot():
+    bot.delete_webhook()
     bot.infinity_polling()
+
 
 threading.Thread(target=run_bot).start()
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
 
-bot.delete_webhook()
-bot.infinity_polling()
+# ===============================
+# RUN FLASK SERVER (PORT 10000)
+# ===============================
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
