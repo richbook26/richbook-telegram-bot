@@ -1,1 +1,1 @@
-# richbook-telegram-bot
+# richbook-market-bot
