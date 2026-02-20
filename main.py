@@ -1,131 +1,136 @@
 import os
 import telebot
+import psycopg2
 import requests
 import threading
-import psycopg2
-from flask import Flask
-
-# ===============================
-# ENVIRONMENT VARIABLES
-# ===============================
+import time
+from flask import Flask, request
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-ADMIN_ID = 8415879298
+GROUP_ID = -1003180892286
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
-# ===============================
-# DATABASE CONNECTION
-# ===============================
+# ================= DATABASE =================
 
 conn = psycopg2.connect(DATABASE_URL)
 cur = conn.cursor()
 
-# Create tables if not exist
 cur.execute("""
 CREATE TABLE IF NOT EXISTS users (
-    id BIGINT PRIMARY KEY
+    user_id BIGINT PRIMARY KEY,
+    verified BOOLEAN DEFAULT FALSE
 );
 """)
 
 cur.execute("""
-CREATE TABLE IF NOT EXISTS orders (
+CREATE TABLE IF NOT EXISTS ads (
     id SERIAL PRIMARY KEY,
     user_id BIGINT,
-    network TEXT,
-    bundle TEXT,
+    ad_text TEXT,
     phone TEXT,
+    ad_type TEXT,
     amount INTEGER,
-    status TEXT DEFAULT 'pending'
+    reference TEXT,
+    status TEXT DEFAULT 'pending',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """)
 
 conn.commit()
 
-# ===============================
-# DATA PLANS (EDIT PRICES HERE)
-# ===============================
+# ================= USER SESSIONS =================
 
-DATA_PLANS = {
-    "mtn_1gb": {"network": "MTN", "bundle": "1GB", "amount": 600},
-    "mtn_2gb": {"network": "MTN", "bundle": "2GB", "amount": 1100},
-    "airteltigo_1gb": {"network": "AirtelTigo", "bundle": "1GB", "amount": 500},
+sessions = {}
+
+AD_PRICES = {
+    "normal": 500,
+    "pinned": 1000,
+    "spotlight": 2000
 }
 
-user_sessions = {}
+# ================= MEMBER JOIN VERIFICATION =================
 
-# ===============================
-# START COMMAND
-# ===============================
+@bot.message_handler(content_types=['new_chat_members'])
+def verify_user(message):
+    for member in message.new_chat_members:
+        bot.restrict_chat_member(
+            message.chat.id,
+            member.id,
+            can_send_messages=False
+        )
 
-@bot.message_handler(commands=['start'])
-def start(message):
-    cur.execute("INSERT INTO users (id) VALUES (%s) ON CONFLICT DO NOTHING;", (message.chat.id,))
-    conn.commit()
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(
+            telebot.types.InlineKeyboardButton(
+                "✅ Verify",
+                callback_data=f"verify_{member.id}"
+            )
+        )
+
+        bot.send_message(
+            message.chat.id,
+            f"Welcome {member.first_name} 👋\nClick verify to access group.",
+            reply_markup=markup
+        )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("verify_"))
+def handle_verify(call):
+    user_id = int(call.data.split("_")[1])
+
+    if call.from_user.id == user_id:
+        bot.restrict_chat_member(
+            call.message.chat.id,
+            user_id,
+            can_send_messages=True
+        )
+
+        cur.execute(
+            "INSERT INTO users (user_id, verified) VALUES (%s, TRUE) ON CONFLICT DO NOTHING;",
+            (user_id,)
+        )
+        conn.commit()
+
+        bot.answer_callback_query(call.id, "Verified!")
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+
+# ================= POST AD FLOW =================
+
+@bot.message_handler(commands=['postad'])
+def start_ad(message):
+    sessions[message.chat.id] = {}
+    bot.send_message(message.chat.id, "Send your ad text:")
+
+@bot.message_handler(func=lambda m: m.chat.id in sessions and "ad_text" not in sessions[m.chat.id])
+def get_ad_text(message):
+    sessions[message.chat.id]["ad_text"] = message.text
+    bot.send_message(message.chat.id, "Enter contact phone number:")
+
+@bot.message_handler(func=lambda m: m.chat.id in sessions and "phone" not in sessions[m.chat.id])
+def get_phone(message):
+    sessions[message.chat.id]["phone"] = message.text
 
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(
-        telebot.types.InlineKeyboardButton("📶 MTN", callback_data="network_mtn"),
-        telebot.types.InlineKeyboardButton("📱 AirtelTigo", callback_data="network_airteltigo")
+        telebot.types.InlineKeyboardButton("₵5 Normal", callback_data="ad_normal"),
+        telebot.types.InlineKeyboardButton("₵10 Pinned", callback_data="ad_pinned"),
+        telebot.types.InlineKeyboardButton("₵20 Spotlight", callback_data="ad_spotlight")
     )
 
-    bot.send_message(message.chat.id, "Choose Network:", reply_markup=markup)
+    bot.send_message(message.chat.id, "Choose ad type:", reply_markup=markup)
 
-# ===============================
-# NETWORK SELECTION
-# ===============================
+@bot.callback_query_handler(func=lambda call: call.data.startswith("ad_"))
+def process_payment(call):
+    ad_type = call.data.split("_")[1]
+    amount = AD_PRICES[ad_type]
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("network_"))
-def choose_bundle(call):
-    network = call.data.split("_")[1]
-
-    markup = telebot.types.InlineKeyboardMarkup()
-
-    for key, plan in DATA_PLANS.items():
-        if plan["network"].lower() == network:
-            markup.add(
-                telebot.types.InlineKeyboardButton(
-                    f'{plan["bundle"]} - ₵{plan["amount"]/100}',
-                    callback_data=f"plan_{key}"
-                )
-            )
-
-    bot.send_message(call.message.chat.id, "Choose Bundle:", reply_markup=markup)
-
-# ===============================
-# PLAN SELECTION
-# ===============================
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("plan_"))
-def ask_phone(call):
-    plan_key = call.data.split("_", 1)[1]
-    user_sessions[call.message.chat.id] = {"plan": plan_key}
-
-    bot.send_message(call.message.chat.id, "Enter phone number to receive data:")
-
-# ===============================
-# PHONE INPUT
-# ===============================
-
-@bot.message_handler(func=lambda message: message.chat.id in user_sessions)
-def save_order(message):
-    session = user_sessions[message.chat.id]
-    plan = DATA_PLANS[session["plan"]]
-
-    phone = message.text.strip()
-
-    cur.execute("""
-        INSERT INTO orders (user_id, network, bundle, phone, amount)
-        VALUES (%s, %s, %s, %s, %s)
-        RETURNING id;
-    """, (message.chat.id, plan["network"], plan["bundle"], phone, plan["amount"]))
-
-    order_id = cur.fetchone()[0]
-    conn.commit()
+    session = sessions.get(call.message.chat.id)
+    if not session:
+        return
 
     headers = {
         "Authorization": f"Bearer {PAYSTACK_SECRET}",
@@ -133,8 +138,8 @@ def save_order(message):
     }
 
     data = {
-        "email": f"user{message.chat.id}@richbook.com",
-        "amount": plan["amount"]
+        "email": f"user{call.from_user.id}@richbook.com",
+        "amount": amount * 100
     }
 
     response = requests.post(
@@ -146,78 +151,75 @@ def save_order(message):
     result = response.json()
 
     if result.get("status"):
-        payment_link = result["data"]["authorization_url"]
+        reference = result["data"]["reference"]
+
+        cur.execute("""
+        INSERT INTO ads (user_id, ad_text, phone, ad_type, amount, reference)
+        VALUES (%s, %s, %s, %s, %s, %s);
+        """, (
+            call.from_user.id,
+            session["ad_text"],
+            session["phone"],
+            ad_type,
+            amount,
+            reference
+        ))
+        conn.commit()
+
         bot.send_message(
-            message.chat.id,
-            f"""
-🛒 Order Created
-
-Network: {plan["network"]}
-Bundle: {plan["bundle"]}
-Number: {phone}
-Amount: ₵{plan["amount"]/100}
-
-Click below to pay:
-{payment_link}
-"""
+            call.message.chat.id,
+            f"Complete payment:\n{result['data']['authorization_url']}"
         )
 
-        bot.send_message(
-            ADMIN_ID,
-            f"""
-🆕 New Order
+        del sessions[call.message.chat.id]
 
-Order ID: {order_id}
-Network: {plan["network"]}
-Bundle: {plan["bundle"]}
-Number: {phone}
-Amount: ₵{plan["amount"]/100}
-Status: Pending
-"""
-        )
-    else:
-        bot.send_message(message.chat.id, "Payment initialization failed.")
+# ================= PAYMENT VERIFICATION =================
 
-    del user_sessions[message.chat.id]
+def check_payments():
+    while True:
+        cur.execute("SELECT id, reference, ad_type, ad_text, phone FROM ads WHERE status='pending';")
+        pending_ads = cur.fetchall()
 
-# ===============================
-# ADMIN PANEL
-# ===============================
+        for ad in pending_ads:
+            ad_id, reference, ad_type, ad_text, phone = ad
 
-@bot.message_handler(commands=['admin'])
-def admin_panel(message):
-    if message.chat.id != ADMIN_ID:
-        return
+            headers = {"Authorization": f"Bearer {PAYSTACK_SECRET}"}
+            res = requests.get(
+                f"https://api.paystack.co/transaction/verify/{reference}",
+                headers=headers
+            ).json()
 
-    cur.execute("SELECT COUNT(*) FROM users;")
-    total_users = cur.fetchone()[0]
+            if res.get("data", {}).get("status") == "success":
+                cur.execute("UPDATE ads SET status='paid' WHERE id=%s;", (ad_id,))
+                conn.commit()
 
-    cur.execute("SELECT COUNT(*) FROM orders;")
-    total_orders = cur.fetchone()[0]
+                tag = "✅ VERIFIED AD"
+                if ad_type == "spotlight":
+                    tag = "🌟 SPOTLIGHT VERIFIED AD"
+                elif ad_type == "pinned":
+                    tag = "📌 PINNED VERIFIED AD"
 
-    bot.send_message(
-        message.chat.id,
-        f"""
-📊 Admin Panel
+                msg = bot.send_message(
+                    GROUP_ID,
+                    f"{tag}\n\n{ad_text}\n\n📱 Contact: {phone}"
+                )
 
-Total Users: {total_users}
-Total Orders: {total_orders}
-"""
-    )
+                if ad_type in ["pinned", "spotlight"]:
+                    bot.pin_chat_message(GROUP_ID, msg.message_id)
 
-# ===============================
-# FLASK SERVER
-# ===============================
+        time.sleep(30)
+
+# ================= START BOT =================
 
 @app.route('/')
 def home():
-    return "Bot is running!"
+    return "RichBook Market Bot Running"
 
 def run_bot():
-    bot.delete_webhook()
     bot.infinity_polling()
 
 threading.Thread(target=run_bot).start()
+threading.Thread(target=check_payments).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
