@@ -1,36 +1,35 @@
 import os
 import telebot
-import psycopg2
+import sqlite3
 import requests
 import threading
 import time
-from flask import Flask, request
+from flask import Flask
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET")
-DATABASE_URL = os.getenv("DATABASE_URL")
 
 GROUP_ID = -1003180892286
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
-# ================= DATABASE =================
+# ================= DATABASE (SQLite) =================
 
-conn = psycopg2.connect(DATABASE_URL)
+conn = sqlite3.connect("richbook.db", check_same_thread=False)
 cur = conn.cursor()
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS users (
-    user_id BIGINT PRIMARY KEY,
-    verified BOOLEAN DEFAULT FALSE
-);
+    user_id INTEGER PRIMARY KEY,
+    verified INTEGER DEFAULT 0
+)
 """)
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS ads (
-    id SERIAL PRIMARY KEY,
-    user_id BIGINT,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
     ad_text TEXT,
     phone TEXT,
     ad_type TEXT,
@@ -38,7 +37,7 @@ CREATE TABLE IF NOT EXISTS ads (
     reference TEXT,
     status TEXT DEFAULT 'pending',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+)
 """)
 
 conn.commit()
@@ -53,16 +52,12 @@ AD_PRICES = {
     "spotlight": 2000
 }
 
-# ================= MEMBER JOIN VERIFICATION =================
+# ================= MEMBER VERIFICATION =================
 
 @bot.message_handler(content_types=['new_chat_members'])
 def verify_user(message):
     for member in message.new_chat_members:
-        bot.restrict_chat_member(
-            message.chat.id,
-            member.id,
-            can_send_messages=False
-        )
+        bot.restrict_chat_member(message.chat.id, member.id, can_send_messages=False)
 
         markup = telebot.types.InlineKeyboardMarkup()
         markup.add(
@@ -83,16 +78,8 @@ def handle_verify(call):
     user_id = int(call.data.split("_")[1])
 
     if call.from_user.id == user_id:
-        bot.restrict_chat_member(
-            call.message.chat.id,
-            user_id,
-            can_send_messages=True
-        )
-
-        cur.execute(
-            "INSERT INTO users (user_id, verified) VALUES (%s, TRUE) ON CONFLICT DO NOTHING;",
-            (user_id,)
-        )
+        bot.restrict_chat_member(call.message.chat.id, user_id, can_send_messages=True)
+        cur.execute("INSERT OR IGNORE INTO users (user_id, verified) VALUES (?, 1)", (user_id,))
         conn.commit()
 
         bot.answer_callback_query(call.id, "Verified!")
@@ -155,7 +142,7 @@ def process_payment(call):
 
         cur.execute("""
         INSERT INTO ads (user_id, ad_text, phone, ad_type, amount, reference)
-        VALUES (%s, %s, %s, %s, %s, %s);
+        VALUES (?, ?, ?, ?, ?, ?)
         """, (
             call.from_user.id,
             session["ad_text"],
@@ -173,11 +160,11 @@ def process_payment(call):
 
         del sessions[call.message.chat.id]
 
-# ================= PAYMENT VERIFICATION =================
+# ================= PAYMENT CHECK =================
 
 def check_payments():
     while True:
-        cur.execute("SELECT id, reference, ad_type, ad_text, phone FROM ads WHERE status='pending';")
+        cur.execute("SELECT id, reference, ad_type, ad_text, phone FROM ads WHERE status='pending'")
         pending_ads = cur.fetchall()
 
         for ad in pending_ads:
@@ -190,7 +177,7 @@ def check_payments():
             ).json()
 
             if res.get("data", {}).get("status") == "success":
-                cur.execute("UPDATE ads SET status='paid' WHERE id=%s;", (ad_id,))
+                cur.execute("UPDATE ads SET status='paid' WHERE id=?", (ad_id,))
                 conn.commit()
 
                 tag = "✅ VERIFIED AD"
@@ -209,7 +196,7 @@ def check_payments():
 
         time.sleep(30)
 
-# ================= START BOT =================
+# ================= START =================
 
 @app.route('/')
 def home():
