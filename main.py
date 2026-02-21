@@ -2,29 +2,22 @@ import os
 import telebot
 import sqlite3
 import requests
-import threading
 import time
 from flask import Flask
+from threading import Thread
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET")
 
 GROUP_ID = -1003180892286
 
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
 
-# ================= DATABASE (SQLite) =================
+# ================= DATABASE =================
 
 conn = sqlite3.connect("richbook.db", check_same_thread=False)
 cur = conn.cursor()
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    verified INTEGER DEFAULT 0
-)
-""")
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS ads (
@@ -35,67 +28,38 @@ CREATE TABLE IF NOT EXISTS ads (
     ad_type TEXT,
     amount INTEGER,
     reference TEXT,
-    status TEXT DEFAULT 'pending',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    status TEXT DEFAULT 'pending'
 )
 """)
-
 conn.commit()
 
-# ================= USER SESSIONS =================
+# ================= SESSION =================
 
 sessions = {}
 
 AD_PRICES = {
-    "normal": 500,
-    "pinned": 1000,
-    "spotlight": 2000
+    "normal": 5,
+    "pinned": 10,
+    "spotlight": 20
 }
 
-# ================= MEMBER VERIFICATION =================
+# ================= START =================
 
-@bot.message_handler(content_types=['new_chat_members'])
-def verify_user(message):
-    for member in message.new_chat_members:
-        bot.restrict_chat_member(message.chat.id, member.id, can_send_messages=False)
-
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(
-            telebot.types.InlineKeyboardButton(
-                "✅ Verify",
-                callback_data=f"verify_{member.id}"
-            )
-        )
-
-        bot.send_message(
-            message.chat.id,
-            f"Welcome {member.first_name} 👋\nClick verify to access group.",
-            reply_markup=markup
-        )
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("verify_"))
-def handle_verify(call):
-    user_id = int(call.data.split("_")[1])
-
-    if call.from_user.id == user_id:
-        bot.restrict_chat_member(call.message.chat.id, user_id, can_send_messages=True)
-        cur.execute("INSERT OR IGNORE INTO users (user_id, verified) VALUES (?, 1)", (user_id,))
-        conn.commit()
-
-        bot.answer_callback_query(call.id, "Verified!")
-        bot.delete_message(call.message.chat.id, call.message.message_id)
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.reply_to(message, "Welcome to RichBook Market Bot 🇬🇭\nUse /postad to post advert.")
 
 # ================= POST AD FLOW =================
 
 @bot.message_handler(commands=['postad'])
-def start_ad(message):
+def post_ad(message):
     sessions[message.chat.id] = {}
-    bot.send_message(message.chat.id, "Send your ad text:")
+    bot.send_message(message.chat.id, "📝 Send your ad text:")
 
 @bot.message_handler(func=lambda m: m.chat.id in sessions and "ad_text" not in sessions[m.chat.id])
-def get_ad_text(message):
+def get_text(message):
     sessions[message.chat.id]["ad_text"] = message.text
-    bot.send_message(message.chat.id, "Enter contact phone number:")
+    bot.send_message(message.chat.id, "📱 Enter contact phone number:")
 
 @bot.message_handler(func=lambda m: m.chat.id in sessions and "phone" not in sessions[m.chat.id])
 def get_phone(message):
@@ -108,12 +72,12 @@ def get_phone(message):
         telebot.types.InlineKeyboardButton("₵20 Spotlight", callback_data="ad_spotlight")
     )
 
-    bot.send_message(message.chat.id, "Choose ad type:", reply_markup=markup)
+    bot.send_message(message.chat.id, "💰 Choose ad type:", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("ad_"))
-def process_payment(call):
+def payment(call):
     ad_type = call.data.split("_")[1]
-    amount = AD_PRICES[ad_type]
+    amount = AD_PRICES.get(ad_type)
 
     session = sessions.get(call.message.chat.id)
     if not session:
@@ -133,12 +97,10 @@ def process_payment(call):
         "https://api.paystack.co/transaction/initialize",
         json=data,
         headers=headers
-    )
+    ).json()
 
-    result = response.json()
-
-    if result.get("status"):
-        reference = result["data"]["reference"]
+    if response.get("status"):
+        reference = response["data"]["reference"]
 
         cur.execute("""
         INSERT INTO ads (user_id, ad_text, phone, ad_type, amount, reference)
@@ -155,59 +117,62 @@ def process_payment(call):
 
         bot.send_message(
             call.message.chat.id,
-            f"Complete payment:\n{result['data']['authorization_url']}"
+            f"✅ Complete payment below:\n{response['data']['authorization_url']}"
         )
 
-        del sessions[call.message.chat.id]
+        sessions.pop(call.message.chat.id, None)
 
-# ================= PAYMENT CHECK =================
+# ================= PAYMENT CHECKER =================
 
 def check_payments():
     while True:
         cur.execute("SELECT id, reference, ad_type, ad_text, phone FROM ads WHERE status='pending'")
-        pending_ads = cur.fetchall()
+        ads = cur.fetchall()
 
-        for ad in pending_ads:
+        for ad in ads:
             ad_id, reference, ad_type, ad_text, phone = ad
 
             headers = {"Authorization": f"Bearer {PAYSTACK_SECRET}"}
-            res = requests.get(
+            verify = requests.get(
                 f"https://api.paystack.co/transaction/verify/{reference}",
                 headers=headers
             ).json()
 
-            if res.get("data", {}).get("status") == "success":
+            if verify.get("data", {}).get("status") == "success":
                 cur.execute("UPDATE ads SET status='paid' WHERE id=?", (ad_id,))
                 conn.commit()
 
                 tag = "✅ VERIFIED AD"
-                if ad_type == "spotlight":
-                    tag = "🌟 SPOTLIGHT VERIFIED AD"
-                elif ad_type == "pinned":
+                if ad_type == "pinned":
                     tag = "📌 PINNED VERIFIED AD"
+                elif ad_type == "spotlight":
+                    tag = "🌟 SPOTLIGHT VERIFIED AD"
 
                 msg = bot.send_message(
                     GROUP_ID,
-                    f"{tag}\n\n{ad_text}\n\n📱 Contact: {phone}"
+                    f"<b>{tag}</b>\n\n{ad_text}\n\n📞 {phone}"
                 )
 
                 if ad_type in ["pinned", "spotlight"]:
                     bot.pin_chat_message(GROUP_ID, msg.message_id)
 
-        time.sleep(30)
+        time.sleep(20)
 
-# ================= START =================
+# ================= FLASK ROUTE =================
 
 @app.route('/')
 def home():
     return "RichBook Market Bot Running"
 
-def run_bot():
-    bot.infinity_polling()
+# ================= RUN =================
 
-threading.Thread(target=run_bot).start()
-threading.Thread(target=check_payments).start()
+def run_bot():
+    bot.delete_webhook()
+    bot.infinity_polling(timeout=60, long_polling_timeout=60)
 
 if __name__ == "__main__":
+    Thread(target=run_bot).start()
+    Thread(target=check_payments).start()
+
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
